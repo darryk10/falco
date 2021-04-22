@@ -42,6 +42,22 @@
     WARNING
   tags: [file, mitre_persistence]
 
+
+- rule: Read ssh information
+  desc: Any attempt to read files below ssh directories by non-ssh programs
+  condition: >
+    ((open_read or open_directory) and
+     consider_ssh_reads and
+     (user_ssh_directory or fd.name startswith /root/.ssh) and
+     not user_known_read_ssh_information_activities and
+     not proc.name in (ssh_binaries))
+  output: >
+    ssh-related file/directory read by non-ssh program (user=%user.name user_loginuid=%user.loginuid
+    command=%proc.cmdline file=%fd.name parent=%proc.pname pcmdline=%proc.pcmdline container_id=%container.id image=%container.image.repository)
+  priority: ERROR
+  tags: [filesystem, mitre_discovery]
+
+
 - rule: DB program spawned process
   desc: >
     a database-server related program spawned a new process other than itself.
@@ -57,19 +73,6 @@
     program=%proc.cmdline parent=%proc.pname container_id=%container.id image=%container.image.repository)
   priority: NOTICE
   tags: [process, database, mitre_execution]
-
-- rule: Launch Privileged Container
-  desc: Detect the initial process started in a privileged container. Exceptions are made for known trusted images.
-  condition: >
-    container_started and container
-    and container.privileged=true
-    and not falco_privileged_containers
-    and not user_privileged_containers
-  output: Privileged container started (user=%user.name user_loginuid=%user.loginuid command=%proc.cmdline %container.info image=%container.image.repository:%container.image.tag)
-  priority: INFO
-  tags: [container, cis, mitre_privilege_escalation, mitre_lateral_movement]
-
-
 
 # Anything run interactively by root
 # - condition: evt.type != switch and user.name = root and proc.name != sshd and interactive
@@ -87,6 +90,18 @@
 # management software may do this, which is expected.
 - macro: user_expected_terminal_shell_in_container_conditions
   condition: (never_true)
+
+- rule: Launch Privileged Container
+  desc: Detect the initial process started in a privileged container. Exceptions are made for known trusted images.
+  condition: >
+    container_started and container
+    and container.privileged=true
+    and not falco_privileged_containers
+    and not user_privileged_containers
+  output: Privileged container started (user=%user.name user_loginuid=%user.loginuid command=%proc.cmdline %container.info image=%container.image.repository:%container.image.tag)
+  priority: INFO
+  tags: [container, cis, mitre_privilege_escalation, mitre_lateral_movement]
+
 
 - rule: Terminal shell in container
   desc: A shell was used as the entrypoint/exec point into a container with an attached terminal.
@@ -188,13 +203,57 @@
     Redirect stdout/stdin to network connection (user=%user.name user_loginuid=%user.loginuid %container.info process=%proc.name parent=%proc.pname cmdline=%proc.cmdline terminal=%proc.tty container_id=%container.id image=%container.image.repository fd.name=%fd.name fd.num=%fd.num fd.type=%fd.type fd.sip=%fd.sip)
   priority: WARNING
 
-- rule: Mount Launched in Privileged Container
-  desc: Detect file system mount happened inside a privilegd container which might lead to container escape.
+- rule: Create Symlink Over Sensitive Files
+  desc: Detect symlink created over sensitive files
   condition: >
-    spawned_process and container
-    and container.privileged=true
-    and proc.name=mount
-    and not mount_info
-  output: Mount was executed inside a privileged container (user=%user.name user_loginuid=%user.loginuid command=%proc.cmdline %container.info image=%container.image.repository:%container.image.tag)
-  priority: WARNING
-  tags: [container, cis, mitre_lateral_movement]
+    create_symlink and
+    (evt.arg.target in (sensitive_file_names) or evt.arg.target in (sensitive_directory_names))
+  output: >
+    Symlinks created over senstivie files (user=%user.name user_loginuid=%user.loginuid command=%proc.cmdline target=%evt.arg.target linkpath=%evt.arg.linkpath parent_process=%proc.pname)
+  priority: NOTICE
+  tags: [file, mitre_exfiltration]
+
+- list: network_tool_binaries
+  items: [nc, ncat, nmap, dig, tcpdump, tshark, ngrep, telnet, mitmproxy, socat, zmap]
+
+- macro: network_tool_procs
+  condition: (proc.name in (network_tool_binaries))
+
+- rule: Launch Suspicious Network Tool in Container
+  desc: Detect network tools launched inside container
+  condition: >
+    spawned_process and container and network_tool_procs and not user_known_network_tool_activities
+  output: >
+    Network tool launched in container (user=%user.name user_loginuid=%user.loginuid command=%proc.cmdline parent_process=%proc.pname
+    container_id=%container.id container_name=%container.name image=%container.image.repository:%container.image.tag)
+  priority: NOTICE
+  tags: [network, process, mitre_discovery, mitre_exfiltration]
+
+# This rule is not enabled by default, as there are legitimate use
+# cases for these tools on hosts. If you want to enable it, modify the
+# following macro.
+- macro: consider_network_tools_on_host
+  condition: (never_true)
+
+- rule: Launch Suspicious Network Tool on Host
+  desc: Detect network tools launched on the host
+  condition: >
+    spawned_process and
+    not container and
+    consider_network_tools_on_host and
+    network_tool_procs and
+    not user_known_network_tool_activities
+  output: >
+    Network tool launched on host (user=%user.name user_loginuid=%user.loginuid command=%proc.cmdline parent_process=%proc.pname)
+  priority: NOTICE
+  tags: [network, process, mitre_discovery, mitre_exfiltration]
+
+
+# This rule helps detect CVE-2021-3156:
+# A privilege escalation to root through heap-based buffer overflow
+- rule: Sudo Potential Privilege Escalation
+  desc: Privilege escalation vulnerability affecting sudo (<= 1.9.5p2). Executing sudo using sudoedit -s or sudoedit -i command with command-line argument that ends with a single backslash character from an unprivileged user it's possible to elevate the user privileges to root.
+  condition: spawned_process and user.uid!= 0 and proc.name=sudoedit and (proc.args contains -s or proc.args contains -i) and (proc.args contains "\ " or proc.args endswith \)
+  output: "Detect Sudo Privilege Escalation Exploit (CVE-2021-3156) (user=%user.name parent=%proc.pname cmdline=%proc.cmdline %container.info)"
+  priority: CRITICAL
+  tags: [filesystem, mitre_privilege_escalation]
