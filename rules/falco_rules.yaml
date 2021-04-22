@@ -1,0 +1,200 @@
+#
+# Copyright (C) 2019 The Falco Authors.
+#
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+####################
+# Your custom rules!
+####################
+
+# Add new rules, like this one
+# - rule: The program "sudo" is run in a container
+#   desc: An event will trigger every time you run sudo in a container
+#   condition: evt.type = execve and evt.dir=< and container.id != host and proc.name = sudo
+#   output: "Sudo run in container (user=%user.name %container.info parent=%proc.pname cmdline=%proc.cmdline)"
+#   priority: ERROR
+#   tags: [users, container]
+
+- rule: Modify Shell Configuration File
+  desc: Detect attempt to modify shell configuration files
+  condition: >
+    open_write and
+    (fd.filename in (shell_config_filenames) or
+     fd.name in (shell_config_files) or
+     fd.directory in (shell_config_directories))
+    and not proc.name in (shell_binaries)
+    and not exe_running_docker_save
+  output: >
+    a shell configuration file has been modified (user=%user.name user_loginuid=%user.loginuid command=%proc.cmdline pcmdline=%proc.pcmdline file=%fd.name container_id=%container.id image=%container.image.repository)
+  priority:
+    WARNING
+  tags: [file, mitre_persistence]
+
+- rule: DB program spawned process
+  desc: >
+    a database-server related program spawned a new process other than itself.
+    This shouldn\'t occur and is a follow on from some SQL injection attacks.
+  condition: >
+    proc.pname in (db_server_binaries)
+    and spawned_process
+    and not proc.name in (db_server_binaries)
+    and not postgres_running_wal_e
+    and not user_known_db_spawned_processes
+  output: >
+    Database-related program spawned process other than itself (user=%user.name user_loginuid=%user.loginuid
+    program=%proc.cmdline parent=%proc.pname container_id=%container.id image=%container.image.repository)
+  priority: NOTICE
+  tags: [process, database, mitre_execution]
+
+- rule: Launch Privileged Container
+  desc: Detect the initial process started in a privileged container. Exceptions are made for known trusted images.
+  condition: >
+    container_started and container
+    and container.privileged=true
+    and not falco_privileged_containers
+    and not user_privileged_containers
+  output: Privileged container started (user=%user.name user_loginuid=%user.loginuid command=%proc.cmdline %container.info image=%container.image.repository:%container.image.tag)
+  priority: INFO
+  tags: [container, cis, mitre_privilege_escalation, mitre_lateral_movement]
+
+
+
+# Anything run interactively by root
+# - condition: evt.type != switch and user.name = root and proc.name != sshd and interactive
+#  output: "Interactive root (%user.name %proc.name %evt.dir %evt.type %evt.args %fd.name)"
+#  priority: WARNING
+
+- rule: System user interactive
+  desc: an attempt to run interactive commands by a system (i.e. non-login) user
+  condition: spawned_process and system_users and interactive and not user_known_system_user_login
+  output: "System user ran an interactive command (user=%user.name user_loginuid=%user.loginuid command=%proc.cmdline container_id=%container.id image=%container.image.repository)"
+  priority: INFO
+  tags: [users, mitre_remote_access_tools]
+
+# In some cases, a shell is expected to be run in a container. For example, configuration
+# management software may do this, which is expected.
+- macro: user_expected_terminal_shell_in_container_conditions
+  condition: (never_true)
+
+- rule: Terminal shell in container
+  desc: A shell was used as the entrypoint/exec point into a container with an attached terminal.
+  condition: >
+    spawned_process and container
+    and shell_procs and proc.tty != 0
+    and container_entrypoint
+    and not user_expected_terminal_shell_in_container_conditions
+  output: >
+    A shell was spawned in a container with an attached terminal (user=%user.name user_loginuid=%user.loginuid %container.info
+    shell=%proc.name parent=%proc.pname cmdline=%proc.cmdline terminal=%proc.tty container_id=%container.id image=%container.image.repository)
+  priority: NOTICE
+  tags: [container, shell, mitre_execution]
+
+
+- rule: Contact EC2 Instance Metadata Service From Container
+  desc: Detect attempts to contact the EC2 Instance Metadata Service from a container
+  condition: outbound and fd.sip="169.254.169.254" and container and not ec2_metadata_containers
+  output: Outbound connection to EC2 instance metadata service (command=%proc.cmdline connection=%fd.name %container.info image=%container.image.repository:%container.image.tag)
+  priority: NOTICE
+  tags: [network, aws, container, mitre_discovery]
+
+
+- rule: Netcat Remote Code Execution in Container
+  desc: Netcat Program runs inside container that allows remote code execution
+  condition: >
+    spawned_process and container and
+    ((proc.name = "nc" and (proc.args contains "-e" or proc.args contains "-c")) or
+     (proc.name = "ncat" and (proc.args contains "--sh-exec" or proc.args contains "--exec" or proc.args contains "-e "
+                              or proc.args contains "-c " or proc.args contains "--lua-exec"))
+    )
+  output: >
+    Netcat runs inside container that allows remote code execution (user=%user.name user_loginuid=%user.loginuid
+    command=%proc.cmdline container_id=%container.id container_name=%container.name image=%container.image.repository:%container.image.tag)
+  priority: WARNING
+  tags: [network, process, mitre_execution]
+
+
+- rule: Search Private Keys or Passwords
+  desc: >
+    Detect grep private keys or passwords activity.
+  condition: >
+    (spawned_process and
+     ((grep_commands and private_key_or_password) or
+      (proc.name = "find" and (proc.args contains "id_rsa" or proc.args contains "id_dsa")))
+    )
+  output: >
+    Grep private keys or passwords activities found
+    (user=%user.name user_loginuid=%user.loginuid command=%proc.cmdline container_id=%container.id container_name=%container.name
+    image=%container.image.repository:%container.image.tag)
+  priority:
+    WARNING
+  tags: [process, mitre_credential_access]
+
+
+- rule: Clear Log Activities
+  desc: Detect clearing of critical log files
+  condition: >
+    open_write and
+    access_log_files and
+    evt.arg.flags contains "O_TRUNC" and
+    not trusted_logging_images and
+    not allowed_clear_log_files
+  output: >
+    Log files were tampered (user=%user.name user_loginuid=%user.loginuid command=%proc.cmdline file=%fd.name container_id=%container.id image=%container.image.repository)
+  priority:
+    WARNING
+  tags: [file, mitre_defense_evasion]
+
+
+- rule: Set Setuid or Setgid bit
+  desc: >
+    When the setuid or setgid bits are set for an application,
+    this means that the application will run with the privileges of the owning user or group respectively.
+    Detect setuid or setgid bits set via chmod
+  condition: >
+    consider_all_chmods and chmod and (evt.arg.mode contains "S_ISUID" or evt.arg.mode contains "S_ISGID")
+    and not proc.name in (user_known_chmod_applications)
+    and not exe_running_docker_save
+    and not user_known_set_setuid_or_setgid_bit_conditions
+  output: >
+    Setuid or setgid bit is set via chmod (fd=%evt.arg.fd filename=%evt.arg.filename mode=%evt.arg.mode user=%user.name user_loginuid=%user.loginuid process=%proc.name
+    command=%proc.cmdline container_id=%container.id container_name=%container.name image=%container.image.repository:%container.image.tag)
+  priority:
+    NOTICE
+  tags: [process, mitre_persistence]
+
+- rule: Packet socket created in container
+  desc: Detect new packet socket at the device driver (OSI Layer 2) level in a container. Packet socket could be used for ARP Spoofing and privilege escalation(CVE-2020-14386) by attacker.
+  condition: evt.type=socket and evt.arg[0]=AF_PACKET and consider_packet_socket_communication and container and not proc.name in (user_known_packet_socket_binaries)
+  output: Packet socket was created in a container (user=%user.name user_loginuid=%user.loginuid command=%proc.cmdline socket_info=%evt.args container_id=%container.id container_name=%container.name image=%container.image.repository:%container.image.tag)
+  priority: NOTICE
+  tags: [network, mitre_discovery]
+
+- rule: Redirect STDOUT/STDIN to Network Connection in Container
+  desc: Detect redirecting stdout/stdin to network connection in container (potential reverse shell).
+  condition: evt.type=dup and evt.dir=> and container and fd.num in (0, 1, 2) and fd.type in ("ipv4", "ipv6") and not user_known_stand_streams_redirect_activities
+  output: >
+    Redirect stdout/stdin to network connection (user=%user.name user_loginuid=%user.loginuid %container.info process=%proc.name parent=%proc.pname cmdline=%proc.cmdline terminal=%proc.tty container_id=%container.id image=%container.image.repository fd.name=%fd.name fd.num=%fd.num fd.type=%fd.type fd.sip=%fd.sip)
+  priority: WARNING
+
+- rule: Mount Launched in Privileged Container
+  desc: Detect file system mount happened inside a privilegd container which might lead to container escape.
+  condition: >
+    spawned_process and container
+    and container.privileged=true
+    and proc.name=mount
+    and not mount_info
+  output: Mount was executed inside a privileged container (user=%user.name user_loginuid=%user.loginuid command=%proc.cmdline %container.info image=%container.image.repository:%container.image.tag)
+  priority: WARNING
+  tags: [container, cis, mitre_lateral_movement]
