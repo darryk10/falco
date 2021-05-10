@@ -27,6 +27,54 @@
 #   priority: ERROR
 #   tags: [users, container]
 
+- list: shell_config_filenames
+  items: [bash_config_filenames, csh_config_filenames, zsh_config_filenames]
+
+  - list: bash_config_filenames
+  items: [.bashrc, .bash_profile, .bash_history, .bash_login, .bash_logout, .inputrc, .profile]
+
+# Covers both csh and tcsh
+- list: csh_config_filenames
+  items: [.cshrc, .login, .logout, .history, .tcshrc, .cshdirs]
+
+- list: csh_config_files
+  items: [/etc/csh.cshrc, /etc/csh.login]
+
+- list: zsh_config_filenames
+  items: [.zshenv, .zprofile, .zshrc, .zlogin, .zlogout]
+
+- list: shell_config_files
+  items: [bash_config_files, csh_config_files]
+
+- list: bash_config_files
+  items: [/etc/profile, /etc/bashrc]
+
+- list: csh_config_files
+  items: [/etc/csh.cshrc, /etc/csh.login]
+
+- macro: open_write
+  condition: (evt.type=open or evt.type=openat) and evt.is_open_write=true and fd.typechar='f' and fd.num>=0
+
+- macro: open_read
+  condition: (evt.type=open or evt.type=openat) and evt.is_open_read=true and fd.typechar='f' and fd.num>=0
+
+- macro: open_directory
+  condition: (evt.type=open or evt.type=openat) and evt.is_open_read=true and fd.typechar='d' and fd.num>=0
+
+
+- list: shell_config_directories
+  items: [/etc/zsh]
+
+- list: shell_binaries
+  items: [ash, bash, csh, ksh, sh, tcsh, zsh, dash]
+
+- macro: exe_running_docker_save
+  condition: >
+    proc.name = "exe"
+    and (proc.cmdline contains "/var/lib/docker"
+    or proc.cmdline contains "/var/run/docker")
+    and proc.pname in (dockerd, docker, dockerd-current, docker-current)
+
 - rule: Modify Shell Configuration File
   desc: Detect attempt to modify shell configuration files
   condition: >
@@ -41,6 +89,16 @@
   priority:
     WARNING
   tags: [file, mitre_persistence]
+
+- macro: consider_ssh_reads
+  condition: (never_true)
+
+- macro: user_ssh_directory
+  condition: (fd.name glob '/home/*/.ssh/*')
+
+- macro: user_known_read_ssh_information_activities
+  condition: (never_true)
+
 
 
 - rule: Read ssh information
